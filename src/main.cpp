@@ -5,11 +5,13 @@
 #include <SPI.h>
 #include <SD.h>
 
-// ESP32-S3 specific I2C pins
+//Pin definitions
+
+// I2C pins for SEN54
 #define I2C_SDA 8
 #define I2C_SCL 9
 
-// ESP32-S3 ADC channel pins
+// 02 ADC pins for ME2-02
 //#define CO_ADC_PIN 4
 #define O2_ADC_PIN 5
 
@@ -17,7 +19,12 @@
 #define ZE07_RX_PIN 18  // ESP32 receives from ZE07 TXD. listens to sensor TXD wire
 #define ZE07_TX_PIN 17  // Optional only for commands 
 
-// SD card SPI pins
+//Alert pins
+#define LED_YELLOW  6
+#define LED_RED     7    
+#define BUZZER_PIN  14 
+
+// SD card module SPI pins
 #define SD_SCK   12
 #define SD_MISO  13
 #define SD_MOSI  11
@@ -27,57 +34,63 @@
 #define SERVICE_UUID "238d650a-4700-4cfb-a085-748030f31de5"
 #define CHARACTERISTIC_UUID "b67f033d-ce15-4434-83db-31f8161afaea"
 
-//globals
+//Globals
+// SEN54 object
+SensirionI2CSen5x sen5x;
+// Create UART1 for the ZE07 sensor 
+HardwareSerial ze07Serial(1);
+// SPI object for SD card
 SPIClass sdSPI(FSPI);
+// BLE objects
+NimBLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+// SD state
 bool sdReady = false;
 
-// ADC configuration
+// Timing millis based
+unsigned long lastO2SampleMs  = 0;
+unsigned long lastZE07ReadMs  = 0;
+unsigned long lastSen54ReadMs = 0;
+unsigned long lastBleSendMs   = 0;
+unsigned long lastPrintMs     = 0;
+unsigned long lastSdLogMs     = 0;
+
+// ADC / TIA config for O2
 const int ADC_MAX_COUNTS = 4095;     // Max count for 12-bit ADC
 const float ADC_REF_VOLTAGE = 3.3f;  // ADC reference voltage
 
-//Timing period 100ms = 10hz
-const uint32_t ME2_TIMER_PERIOD = 100000;
+const float O2_VREF = 1.65f;        //midpoint VREF from TIA
+const float O2_RF_OHMS = 10000.0f;   // testing with 10k ohms feedback TIA
 
-// Number of ADC samples to average every 100 ms
-const uint8_t ADC_SAMPLES_TO_AVG = 10;
+// Sensor #1 inspection-sheet fit:
+// 20.9% -> 138 uA
+// 10.0% -> 64.6 uA
+// O2(%) = 0.1485 * IuA + 0.41
+const float O2_SLOPE  = 0.1485f;
+const float O2_OFFSET = 0.41f;
 
-// SEN54 and BLE objects
-SensirionI2CSen5x sen5x;
-NimBLECharacteristic* pCharacteristic = nullptr;
-bool deviceConnected = false;
+// Thresholds for alerts 
+const float O2_ALARM  = 19.5f;
+
+const float CO_WARNING_PPM = 35.0f;
+const float CO_DANGER_PPM  = 50.0f;
 
 // Latest SEN54 values
 float latestPm2p5 = 0.0f;
 float latestPm10 = 0.0f;
 float latestTemp = 0.0f;
 float latestRh = 0.0f;
+bool sen54Valid = false;
 
-//Create UART1 for the ZE07 sensor
-HardwareSerial ze07Serial(1);
+// Latest ME2-O2 values
+uint16_t latestO2Counts = 0;
+float latestO2Voltage = 0.0f;
+float latestO2CurrentUA = 0.0f;
+float latestO2Percent = 0.0f;
 
 //Latest ZE07-CO value
 float latestZE07ppm = 0.0f;
 bool ze07Valid = false;
-
-
-// Latest ME2 ADC values
-//uint16_t latestCoCounts = 0;
-uint16_t latestO2Counts = 0;
-
-//float latestCoVoltage   = 0.0f;
-float latestO2Voltage   = 0.0f;
-
-
-// Timers
-unsigned long sensorTimer = 0;
-unsigned long bleTimer = 0;
-
-//Hardware timer ISR 
-hw_timer_t* sampleTimer = nullptr; //holds the ESP32 hardware timer
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-
-volatile bool me2SampleFlag = false; // tells loop() that a sample is due
-volatile uint32_t me2SampleIndex = 0; // Counts timer events
 
 // BLE callbacks
 // Runs when phone connects/disconnects
@@ -97,57 +110,11 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     }
 };
 
-// ISR: hardware timer fires every 100 ms
-// only set a flag/counter
-void IRAM_ATTR onSampleTimer() {
-    portENTER_CRITICAL_ISR(&timerMux);
-    me2SampleFlag = true;
-    me2SampleIndex++;
-    portEXIT_CRITICAL_ISR(&timerMux);
-}
-
-// ADC setup for ME2 sensor channels
-void setupME2ADC() {
-    // Set ADC resolution to 12-bit
-    analogReadResolution(12);
-
-    // Set 11dB attenuation for wider input voltage range
-    //analogSetPinAttenuation(CO_ADC_PIN, ADC_11db);
-    analogSetPinAttenuation(O2_ADC_PIN, ADC_11db);
-
-    // Configure pins as inputs
-    //pinMode(CO_ADC_PIN, INPUT);
-    pinMode(O2_ADC_PIN, INPUT);
-
-    Serial.println("ME2 ADC setup complete");
-}
-
-// Hardware timer setup running every 100ms
-void setupHardwareTimer() {
-    sampleTimer = timerBegin(0, 80, true);
-
-    if (sampleTimer == nullptr) {
-        Serial.println("Timer init failed");
-        while (true) {
-            delay(1000);
-        }
-    }
-
-    timerAttachInterrupt(sampleTimer, &onSampleTimer, true);
-    timerAlarmWrite(sampleTimer, ME2_TIMER_PERIOD, true);
-    timerAlarmEnable(sampleTimer);
-
-    Serial.println("Hardware timer started");
-    Serial.println("Timer tick = 1 us");
-    Serial.println("Timer period = 100000 us = 100 ms = 10 Hz");
-}
-
 // Convert ADC counts to voltage
 // Formula: voltage = (counts / 4095) * 3.3
 float countsToVoltage(uint16_t counts) {
     return ((float)counts / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
 }
-
 
 // Take N ADC samples and average them to reduce ADC noise
 uint16_t readAveragedADC(uint8_t pin, uint8_t numSamples) {
@@ -159,27 +126,57 @@ uint16_t readAveragedADC(uint8_t pin, uint8_t numSamples) {
         // Small spacing between ADC reads
         delayMicroseconds(100);
     }
-
     return (uint16_t)(sum / numSamples);
 }
 
-
-// Read ME2 sensor channels
-// This reads the TIA output voltage through the ESP32 ADC
-void readME2SensorsAveraged(uint8_t numSamples) {
-    // Read raw ADC counts
-    //latestCoCounts = readAveragedADC(CO_ADC_PIN, numSamples);
-    latestO2Counts = readAveragedADC(O2_ADC_PIN, numSamples);
-
-    // Convert counts to voltage
-    //latestCoVoltage = countsToVoltage(latestCoCounts);
-    latestO2Voltage = countsToVoltage(latestO2Counts);
+// Convert TIA output Voltage back to sensor current (TIA equation) I = (Vref - Vout) / Rf
+float voltageToCurrentUA(float vout) {
+    float currentA = (O2_VREF - vout) / O2_RF_OHMS;
+    return currentA * 1e6f;
 }
+
+// Convert sensor current to O2 percentage using calibration
+float currentUAToO2Percent(float currentUA) {
+    return (O2_SLOPE * currentUA) + O2_OFFSET;
+}
+
+// ADC setup for ME2-O2 sensor channels
+void setupO2ADC() {
+    // Set ADC resolution to 12-bit
+    analogReadResolution(12);
+
+    // Set 11dB attenuation for wider input voltage range
+    analogSetPinAttenuation(O2_ADC_PIN, ADC_11db);
+
+    // Configure pins as inputs
+    pinMode(O2_ADC_PIN, INPUT);
+
+    Serial.println("ME2-O2 ADC setup complete");
+}
+
+// Read ME2-O2 sensor channels
+// This reads the TIA output voltage through the ESP32 ADC
+void readO2Sensor(uint8_t numSamples) {
+    // Read raw ADC counts
+    latestO2Counts = readAveragedADC(O2_ADC_PIN, numSamples);
+    // Convert ADC counts to voltage
+    latestO2Voltage = countsToVoltage(latestO2Counts);
+    if (latestO2Counts <= 5) {
+        latestO2CurrentUA = 0.0f;
+        latestO2Percent = 0.0f;
+        Serial.println("O2 reading invalid - check wiring / hook grabbers");
+        return;
+    }
+    // Converts voltage to sensor current
+    latestO2CurrentUA = voltageToCurrentUA(latestO2Voltage);
+    // Converts current to oxygen percentage using calibration
+    latestO2Percent = currentUAToO2Percent(latestO2CurrentUA);
+}
+
 // ZE07 checksum helper
 // Frame points to an array of bytes. This is 9-byte UART frame from sensor
 uint8_t ze07Checksum(const uint8_t *frame) { 
     uint8_t sum = 0;
-
     // skips index 0 because it is the start byte
     for (int i = 1; i <= 7; i++) {
         sum += frame[i]; // sum = frame[1] +....+ frame[7]
@@ -220,6 +217,21 @@ bool readZE07ppm(float &ppm) {
 
     return true;
 }
+
+// Updates CO reading from ZE07 sensor
+void updateZE07() {
+    // Temporary variable to store new CO value ppm
+    float ppm = 0.0f;
+    // readZE07ppm() returns true only if checksum + data are valid
+    if (readZE07ppm(ppm)) {
+        // Save the valid CO reading to global variable
+        latestZE07ppm = ppm;
+        // Mark that we have received valid data at least once
+        ze07Valid = true;
+    }
+    // If read fails, we keep the previous value   
+}
+
 // Sensor SEN54 setup
 void setupSen54() {
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -243,6 +255,32 @@ void setupSen54() {
     } else {
         Serial.println("SEN54 measurement started");
         Serial.println("Waiting for stable readings...");
+    }
+}
+
+// Read SEN54 values
+void readSen54() {
+    float pm1, pm2p5, pm4, pm10, rh, temp, voc, nox;
+
+    uint16_t sensorStatus = sen5x.readMeasuredValues(
+        pm1, pm2p5, pm4, pm10, rh, temp, voc, nox
+    );
+
+    if (sensorStatus == 0) {
+        latestPm2p5 = pm2p5;
+        latestPm10  = pm10;
+        latestTemp  = temp;
+        latestRh    = rh;
+
+        Serial.println("----------------------------");
+        Serial.printf("Time: %lu ms\n", millis());
+
+        Serial.printf("PM2.5: %-6.2f ug/m3   PM10: %-6.2f ug/m3\n", pm2p5, pm10);
+        Serial.printf("Temp : %-6.2f C       RH  : %-6.2f %%\n", temp, rh);
+    } else {
+        char errorMessage[256];
+        errorToString(sensorStatus, errorMessage, 256);
+        Serial.printf("Sensor Error: %s\n", errorMessage);
     }
 }
 
@@ -270,31 +308,6 @@ void setupBLE() {
     Serial.println("BLE advertising started");
 }
 
-// Read SEN54 values
-void readSen54() {
-    float pm1, pm2p5, pm4, pm10, rh, temp, voc, nox;
-
-    uint16_t sensorStatus = sen5x.readMeasuredValues(
-        pm1, pm2p5, pm4, pm10, rh, temp, voc, nox
-    );
-
-    if (sensorStatus == 0) {
-        latestPm2p5 = pm2p5;
-        latestPm10  = pm10;
-        latestTemp  = temp;
-        latestRh    = rh;
-
-        Serial.println("----------------------------------");
-        Serial.printf("PM2.5: %.2f ug/m3\n", latestPm2p5);
-        Serial.printf("PM10 : %.2f ug/m3\n", latestPm10);
-        Serial.printf("Temp : %.2f C\n", latestTemp);
-        Serial.printf("RH   : %.2f %\n", latestRh);
-    } else {
-        char errorMessage[256];
-        errorToString(sensorStatus, errorMessage, 256);
-        Serial.printf("Sensor Error: %s\n", errorMessage);
-    }
-}
 
 // Checksum XOR function for BLE text payload
 uint8_t calculateChecksum(const char* data) {
@@ -309,10 +322,10 @@ uint8_t calculateChecksum(const char* data) {
 }
 //Send BLE Update
 void sendBleUpdate() {
-    char basePayload[100];
-    char finalPayload[120];
+    char basePayload[180];
+    char finalPayload[220];
 
-    sprintf(basePayload, "PM2.5=%.2f ug/m3, PM10=%.2f ug/m3, Temp=%.2fC, Hum=%.2f % ", latestPm2p5, latestPm10, latestTemp, latestRh);
+    sprintf(basePayload, "O2=%.2f,CO=%.1f,PM2.5=%.2f,PM10=%.2f,Temp=%.2f,RH=%.2f", latestO2Percent, latestZE07ppm, latestPm2p5, latestPm10, latestTemp, latestRh);
 
     //Compute checksum
     uint8_t checksum = calculateChecksum(basePayload);
@@ -368,21 +381,33 @@ void setupSDCard() {
     uint64_t cardSizeMB = SD.cardSize() / (1024 * 1024);
     Serial.printf("SD card size: %llu MB\n", cardSizeMB);
 
-    // Create CSV header if file does not exist
+    // Create ZE07 CSV header if file does not exist
     if (!SD.exists("/ze07_log.csv")) {
         File file = SD.open("/ze07_log.csv", FILE_WRITE);
         if (file) {
-            file.println("timestamp_ms,elapsed_hr,sample_index,ze07_ppm");
+            file.println("timestamp_ms,elapsed_hr,ze07_ppm");
             file.close();
-            Serial.println("Created /ze07_log.csv with header");
+            Serial.println("Created /ze07_log.csv");
         } else {
             Serial.println("Failed to create /ze07_log.csv");
         }
     }
+
+    // Create O2 CSV header if file does not exist
+    if (!SD.exists("/o2_log.csv")) {
+        File file = SD.open("/o2_log.csv", FILE_WRITE);
+        if (file) {
+            file.println("timestamp_ms,elapsed_hr,o2_adc_counts,o2_voltage_v,o2_current_ua,o2_percent");
+            file.close();
+            Serial.println("Created /o2_log.csv");
+        } else {
+            Serial.println("Failed to create /o2_log.csv");
+        }
+    }
 }
 
-void logZE07DataToSD(uint32_t timestampMs, float elapsedHours, uint32_t sampleIndex,
-                    float ze07ppm) {
+
+void logZE07DataToSD(uint32_t timestampMs, float elapsedHours, float ze07ppm) {
     if (!sdReady) {
         return;
     }
@@ -393,14 +418,59 @@ void logZE07DataToSD(uint32_t timestampMs, float elapsedHours, uint32_t sampleIn
         return;
     }
 
-    file.printf("%lu,%.3f,%lu,%.1f\n",
+    file.printf("%lu,%.3f,%.1f\n",
                 (unsigned long)timestampMs,
-                elapsedHours,
-                (unsigned long)sampleIndex,
-                ze07ppm);
+                elapsedHours, ze07ppm);
     //Serial.println("SD write good"); //writing to sd card works
 
     file.close();
+}
+
+// Log O2 data to SD card
+void logO2DataToSD(uint32_t timestampMs, float elapsedHours) {
+    if (!sdReady) {
+        return;
+    }
+
+    File file = SD.open("/o2_log.csv", FILE_APPEND);
+    if (!file) {
+        Serial.println("Failed to open /o2_log.csv for append");
+        return;
+    }
+
+    file.printf("%lu,%.3f,%u,%.4f,%.2f,%.2f\n", (unsigned long)timestampMs, 
+                elapsedHours, latestO2Counts, latestO2Voltage, 
+                latestO2CurrentUA, latestO2Percent);
+
+    file.close();
+}
+
+// Alert logic
+// Yellow LED = warning (CO >= 35 ppm)
+// Red LED + buzzer = danger (CO >= 50 ppm OR O2 < 19.5%)
+void updateAlerts() {
+
+     // Danger conditions
+    bool o2Danger = (latestO2Percent < O2_ALARM);
+    bool coDanger = (latestZE07ppm >= CO_DANGER_PPM);
+
+    // Warning condition
+    bool coWarning = (latestZE07ppm >= CO_WARNING_PPM);
+
+    // Reset all outputs first
+    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_RED, LOW);
+    noTone(BUZZER_PIN);
+
+    // Danger has highest priority
+    if (o2Danger || coDanger) {
+        digitalWrite(LED_RED, HIGH);
+        tone(BUZZER_PIN, 2000);
+    }
+    // Warning only
+    else if (coWarning) {
+        digitalWrite(LED_YELLOW, HIGH);
+    }
 }
 
 
@@ -410,14 +480,23 @@ void setup() {
         delay(10);
     }
     Serial.println();
-    Serial.println("Starting ZE07-CO test");
-    Serial.println("Starting SEN54 + ME2 + BLE test");
+    Serial.println("Starting full system test");
+    
+    //Serial.println("ZE07 + SEN54 + O2 + BLE + SD + alerts");
 
-    //setupSen54();
-    //setupME2ADC();
+     // Alert outputs
+    pinMode(LED_YELLOW, OUTPUT);
+    pinMode(LED_RED, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+
+    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_RED, LOW);
+    noTone(BUZZER_PIN);
+
+    // Setup sensors
+    setupSen54();
+    setupO2ADC();
     //setupBLE();
-    //setupHardwareTimer();
-
     //setupSDCard();
 
     // Start ZE07 UART
@@ -426,80 +505,76 @@ void setup() {
     Serial.println("ZE07-CO UART started");
     Serial.println("Allow sensor to warm up (3-5 min)");
 
-   // CSV header for calibration logging over UART
-   Serial.println("timestamp_ms,elapsed_hr,sample_index,ze07_ppm");
+   // CSV-style serial headers
+    //Serial.println("timestamp_ms,elapsed_hr,ze07_ppm,o2_percent");
 }
 
 void loop() {
-      
-    // Read ZE07 UART 
-    float ppm = 0.0f;
-
-    if (readZE07ppm(ppm)) {
-        latestZE07ppm = ppm;
-        ze07Valid = true;
-
-        uint32_t timestampMs = millis();
-        float elapsedHours = timestampMs / 3600000.0f;
-
-        // CSV line (for logging)
-        Serial.printf("%lu,%.3f,%.1f\n",
-              (unsigned long)timestampMs,
-              elapsedHours,
-              latestZE07ppm);
-
-        Serial.print("CO ppm: ");
-        Serial.println(latestZE07ppm, 1);
-    }   
-/*
-     // Handle ME2 sampling flag using 100ms timer
-    bool doSample = false;
-    uint32_t localSampleIndex = 0;
-
-    portENTER_CRITICAL(&timerMux);
-    if (me2SampleFlag) {
-        me2SampleFlag = false;
-        doSample = true;
-        localSampleIndex = me2SampleIndex;
-    }
-    portEXIT_CRITICAL(&timerMux);
-
-    if (doSample) {
-        uint32_t timestampMs = millis();
-
-        // Average 10 ADC reads per channel every 100 ms
-        //readME2SensorsAveraged(ADC_SAMPLES_TO_AVG);
-
+    unsigned long now = millis();
+    float elapsedHours = now / 3600000.0f; 
     
-    float elapsedHours = timestampMs / 3600000.0f;
-
-    //Serial.printf("%lu,%.3f,%lu,%.1f\n",
-     //         (unsigned long)timestampMs,
-     //         elapsedHours,
-     //         (unsigned long)localSampleIndex,
-      //        latestZE07ppm);
-
-    //logZE07DataToSD(timestampMs, elapsedHours, localSampleIndex, latestZE07ppm);
-        Serial.printf("%lu,%lu,%u,%.4f,%u,%.4f\n",
-                      (unsigned long)timestampMs,
-                      (unsigned long)localSampleIndex,
-                      latestCoCounts,
-                      latestCoVoltage,
-                      latestO2Counts,
-                      latestO2Voltage);
-                    
-    }
-
-    // Read and print SEN54 every 1 second
-    if (millis() - sensorTimer >= 1000) {
-        sensorTimer = millis(); // update sensortimer to miilis(1000)
+    if (now - lastSen54ReadMs >= 1000) {
+        lastSen54ReadMs = now;
         readSen54();
     }
+    // Read ZE07 every 1 second
+    if (now - lastZE07ReadMs >= 1000) {
+        lastZE07ReadMs = now;
+        updateZE07();
+    }
 
-    // Send BLE update every 5 seconds
-    if (millis() - bleTimer >= 5000) {
-        bleTimer = millis(); //upate bletimer to millis(5000)
+    // Read O2 every 1 second
+    if (now - lastO2SampleMs >= 1000) {
+        lastO2SampleMs = now;
+        readO2Sensor(10);
+    }
+
+    // Update alarms continuously
+    updateAlerts();
+/*
+    // Send BLE every 2 seconds
+    if (now - lastBleSendMs >= 2000) {
+        lastBleSendMs = now;
         sendBleUpdate();
     }
-*/
+    // Log to SD every 1 second
+    if (now - lastSdLogMs >= 1000) {
+        lastSdLogMs = now;
+
+        logZE07DataToSD(now, elapsedHours, latestZE07ppm);
+        logO2DataToSD(now, elapsedHours);
+    }
+*/  if (now - lastPrintMs >= 1000) {
+        lastPrintMs = now;
+    // Keep serial print
+        Serial.println("========== SYSTEM READINGS ==========");
+        Serial.print("ZE07 CO ppm: ");
+        Serial.println(latestZE07ppm, 1);
+
+        Serial.print("O2 ADC Counts: ");
+        Serial.println(latestO2Counts);
+
+        Serial.print("O2 Voltage: ");
+        Serial.println(latestO2Voltage, 4);
+
+        Serial.print("O2 Current uA: ");
+        Serial.println(latestO2CurrentUA, 2);
+
+        Serial.print("O2 Percent: ");
+        Serial.println(latestO2Percent, 2);
+
+        Serial.print("PM2.5: ");
+        Serial.println(latestPm2p5, 2);
+
+        Serial.print("PM10: ");
+        Serial.println(latestPm10, 2);
+
+        Serial.print("Temp: ");
+        Serial.println(latestTemp, 2);
+
+        Serial.print("RH: ");
+        Serial.println(latestRh, 2);
+
+        Serial.println();
+    }
 }
