@@ -37,6 +37,8 @@
 //Globals
 // SEN54 object
 SensirionI2CSen5x sen5x;
+// Hardware timer
+hw_timer_t* sampleTimer = nullptr; //points to esp32 timer
 // Create UART1 for the ZE07 sensor 
 HardwareSerial ze07Serial(1);
 // SPI object for SD card
@@ -47,13 +49,11 @@ bool deviceConnected = false;
 // SD state
 bool sdReady = false;
 
-// Timing millis based
-unsigned long lastO2SampleMs  = 0;
-unsigned long lastZE07ReadMs  = 0;
-unsigned long lastSen54ReadMs = 0;
-unsigned long lastBleSendMs   = 0;
-unsigned long lastPrintMs     = 0;
-unsigned long lastSdLogMs     = 0;
+volatile bool sampleFlag = false;      // Set by ISR every 1 second
+volatile bool bleFlag = false;         // Set every 2 seconds
+volatile bool sdLogFlag = false;       // Optional: set every 1 second for SD logging
+volatile bool printFlag = false;
+volatile uint32_t timerTickCount = 0;  // Counts how many timer interrupts have happened
 
 // ADC / TIA config for O2
 const int ADC_MAX_COUNTS = 4095;     // Max count for 12-bit ADC
@@ -161,12 +161,14 @@ void readO2Sensor(uint8_t numSamples) {
     latestO2Counts = readAveragedADC(O2_ADC_PIN, numSamples);
     // Convert ADC counts to voltage
     latestO2Voltage = countsToVoltage(latestO2Counts);
+  /*
     if (latestO2Counts <= 5) {
         latestO2CurrentUA = 0.0f;
         latestO2Percent = 0.0f;
-        Serial.println("O2 reading invalid - check wiring / hook grabbers");
+        Serial.println("O2 reading invalid - check wiring");
         return;
     }
+    */
     // Converts voltage to sensor current
     latestO2CurrentUA = voltageToCurrentUA(latestO2Voltage);
     // Converts current to oxygen percentage using calibration
@@ -473,6 +475,41 @@ void updateAlerts() {
     }
 }
 
+// Timer ISR: only set flags, do not read sensors here
+void IRAM_ATTR onSampleTimer() {
+    sampleFlag = true;      // Tell loop() it is time to read sensors
+    sdLogFlag = true;       // Tell loop() it is time to log if SD is enabled
+    printFlag = true;
+    timerTickCount++;       // Count timer ticks
+
+    // Every 2 ticks = every 2 seconds if timer runs at 1 Hz
+    if ((timerTickCount % 2) == 0) {
+        bleFlag = true;
+    }
+}
+
+// Configure 1 hardware timer for 1-second system heartbeat
+void setupSampleTimer() {
+     // Use hardware timer 0
+    // Divider 80 means:
+    // 80 MHz / 80 = 1 MHz timer clock
+    // so 1 tick = 1 microsecond
+    sampleTimer = timerBegin(0, 80, true);
+
+    // Attach ISR
+    // true = edge triggered
+    timerAttachInterrupt(sampleTimer, &onSampleTimer, true);
+
+    // Set alarm for 1,000,000 ticks = 1 second
+    // true = auto reload
+    timerAlarmWrite(sampleTimer, 1000000, true);
+
+    // Enable timer alarm
+    timerAlarmEnable(sampleTimer);
+
+    Serial.println("Hardware timer started: 1 Hz");
+}
+
 
 void setup() {
    Serial.begin(115200);
@@ -480,7 +517,7 @@ void setup() {
         delay(10);
     }
     Serial.println();
-    Serial.println("Starting full system test");
+    //Serial.println("Starting full system test");
     
     //Serial.println("ZE07 + SEN54 + O2 + BLE + SD + alerts");
 
@@ -501,55 +538,100 @@ void setup() {
 
     // Start ZE07 UART
     // Datasheet default 9600 baud, 8N1
-    ze07Serial.begin(9600, SERIAL_8N1, ZE07_RX_PIN, ZE07_TX_PIN);
-    Serial.println("ZE07-CO UART started");
-    Serial.println("Allow sensor to warm up (3-5 min)");
+    //ze07Serial.begin(9600, SERIAL_8N1, ZE07_RX_PIN, ZE07_TX_PIN);
+   // Serial.println("ZE07-CO UART started");
+    //Serial.println("Allow sensor to warm up (3-5 min)");
 
-   // CSV-style serial headers
+
+    // CSV-style serial headers
     //Serial.println("timestamp_ms,elapsed_hr,ze07_ppm,o2_percent");
+
+    Serial.println("O2 overnight aging test started");
+    Serial.println("timestamp_ms,elapsed_hr,o2_counts,o2_voltage,o2_current_ua,o2_percent");
+
+    // Start 1 Hz hardware timer after sensors are initialized
+    setupSampleTimer();
 }
 
 void loop() {
     unsigned long now = millis();
-    float elapsedHours = now / 3600000.0f; 
-    
-    if (now - lastSen54ReadMs >= 1000) {
-        lastSen54ReadMs = now;
-        readSen54();
-    }
-    // Read ZE07 every 1 second
-    if (now - lastZE07ReadMs >= 1000) {
-        lastZE07ReadMs = now;
-        updateZE07();
+    float elapsedHours = now / 3600000.0f;
+
+    // Local copies of ISR flags
+    bool doSample = false;
+    bool doBle = false;
+    bool doSdLog = false;
+    bool doPrint = false;
+
+    // Safely copy and clear shared flags
+    noInterrupts();
+    if (sampleFlag) {
+        sampleFlag = false;
+        doSample = true;
     }
 
-    // Read O2 every 1 second
-    if (now - lastO2SampleMs >= 1000) {
-        lastO2SampleMs = now;
-        readO2Sensor(10);
+    if (bleFlag) {
+        bleFlag = false;
+        doBle = true;
     }
 
-    // Update alarms continuously
-    updateAlerts();
-/*
-    // Send BLE every 2 seconds
-    if (now - lastBleSendMs >= 2000) {
-        lastBleSendMs = now;
-        sendBleUpdate();
+    if (sdLogFlag) {
+        sdLogFlag = false;
+        doSdLog = true;
     }
-    // Log to SD every 1 second
-    if (now - lastSdLogMs >= 1000) {
-        lastSdLogMs = now;
 
+     if (printFlag) {
+        printFlag = false;
+        doPrint = true;
+    }
+    //turn interrupts back on after the shared data is handled
+    interrupts();
+
+    // Sensor sampling block runs once each timer tick
+    if (doSample) {
+        //readSen54();       // Read PM / temp / RH over I2C
+        //updateZE07();      // Read CO frame over UART
+        readO2Sensor(10);  // Read O2 ADC with averaging
+
+        Serial.print(now);
+        Serial.print(",");
+
+        Serial.print(elapsedHours, 6);
+        Serial.print(",");
+
+        Serial.print(latestO2Counts);
+        Serial.print(",");
+
+        Serial.print(latestO2Voltage, 4);
+        Serial.print(",");
+
+        Serial.print(latestO2CurrentUA, 2);
+        Serial.print(",");
+
+        Serial.println(latestO2Percent, 2);
+
+        // Update alerts after new sensor values
+        //updateAlerts();
+    }
+
+    // BLE block - runs every 2 seconds
+    if (doBle) {
+        //sendBleUpdate();
+    }
+
+    // SD logging block - runs once per second if enabled
+    if (doSdLog) {
+        /*
         logZE07DataToSD(now, elapsedHours, latestZE07ppm);
         logO2DataToSD(now, elapsedHours);
+        */
     }
-*/  if (now - lastPrintMs >= 1000) {
-        lastPrintMs = now;
-    // Keep serial print
+    /*
+    // Serial printing every second
+    if (doPrint) {
         Serial.println("========== SYSTEM READINGS ==========");
-        Serial.print("ZE07 CO ppm: ");
-        Serial.println(latestZE07ppm, 1);
+        //Serial.print("ZE07 CO ppm: ");
+       // Serial.println(latestZE07ppm, 1);
 
         Serial.print("O2 ADC Counts: ");
         Serial.println(latestO2Counts);
@@ -563,18 +645,19 @@ void loop() {
         Serial.print("O2 Percent: ");
         Serial.println(latestO2Percent, 2);
 
-        Serial.print("PM2.5: ");
-        Serial.println(latestPm2p5, 2);
+       // Serial.print("PM2.5: ");
+       // Serial.println(latestPm2p5, 2);
 
-        Serial.print("PM10: ");
-        Serial.println(latestPm10, 2);
+       // Serial.print("PM10: ");
+       // Serial.println(latestPm10, 2);
 
-        Serial.print("Temp: ");
-        Serial.println(latestTemp, 2);
+        //Serial.print("Temp: ");
+       // Serial.println(latestTemp, 2);
 
-        Serial.print("RH: ");
-        Serial.println(latestRh, 2);
+       // Serial.print("RH: ");
+       // Serial.println(latestRh, 2);
 
         Serial.println();
     }
+        */
 }
