@@ -20,7 +20,7 @@
 #define ZE07_TX_PIN 17  // Optional only for commands 
 
 //Alert pins
-#define LED_YELLOW  6
+#define LED_GREEN  6
 #define LED_RED     7    
 #define BUZZER_PIN  14 
 
@@ -48,6 +48,7 @@ NimBLECharacteristic* pCharacteristic = nullptr;
 bool deviceConnected = false;
 // SD state
 bool sdReady = false;
+
 
 volatile bool sampleFlag = false;      // Set by ISR every 1 second
 volatile bool bleFlag = false;         // Set every 2 seconds
@@ -396,14 +397,14 @@ void setupSDCard() {
     }
 
     // Create O2 CSV header if file does not exist
-    if (!SD.exists("/o2_log.csv")) {
-        File file = SD.open("/o2_log.csv", FILE_WRITE);
+    if (!SD.exists("/o2_logtest1.csv")) {
+        File file = SD.open("/o2_logtest1.csv", FILE_WRITE);
         if (file) {
             file.println("timestamp_ms,elapsed_hr,o2_adc_counts,o2_voltage_v,o2_current_ua,o2_percent");
             file.close();
-            Serial.println("Created /o2_log.csv");
+            Serial.println("Created /o2_logtest1.csv");
         } else {
-            Serial.println("Failed to create /o2_log.csv");
+            Serial.println("Failed to create /o2_logtest1.csv");
         }
     }
 }
@@ -434,9 +435,9 @@ void logO2DataToSD(uint32_t timestampMs, float elapsedHours) {
         return;
     }
 
-    File file = SD.open("/o2_log.csv", FILE_APPEND);
+    File file = SD.open("/o2_logtest1.csv", FILE_APPEND);
     if (!file) {
-        Serial.println("Failed to open /o2_log.csv for append");
+        Serial.println("Failed to open /o2_logtest1.csv for append");
         return;
     }
 
@@ -451,27 +452,18 @@ void logO2DataToSD(uint32_t timestampMs, float elapsedHours) {
 // Yellow LED = warning (CO >= 35 ppm)
 // Red LED + buzzer = danger (CO >= 50 ppm OR O2 < 19.5%)
 void updateAlerts() {
-
-     // Danger conditions
-    bool o2Danger = (latestO2Percent < O2_ALARM);
-    bool coDanger = (latestZE07ppm >= CO_DANGER_PPM);
-
-    // Warning condition
-    bool coWarning = (latestZE07ppm >= CO_WARNING_PPM);
-
     // Reset all outputs first
-    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_GREEN, LOW);
     digitalWrite(LED_RED, LOW);
-    noTone(BUZZER_PIN);
-
-    // Danger has highest priority
-    if (o2Danger || coDanger) {
+    //noTone(BUZZER_PIN);
+    
+    //Safe threshold
+    if (latestO2Percent >= O2_ALARM) {
+        // SAFE above 19.5
+        digitalWrite(LED_GREEN, HIGH);
+    } else {
+        // DANGER
         digitalWrite(LED_RED, HIGH);
-        tone(BUZZER_PIN, 2000);
-    }
-    // Warning only
-    else if (coWarning) {
-        digitalWrite(LED_YELLOW, HIGH);
     }
 }
 
@@ -516,25 +508,24 @@ void setup() {
     while (!Serial) {
         delay(10);
     }
-    Serial.println();
     //Serial.println("Starting full system test");
     
     //Serial.println("ZE07 + SEN54 + O2 + BLE + SD + alerts");
 
      // Alert outputs
-    pinMode(LED_YELLOW, OUTPUT);
+    pinMode(LED_GREEN, OUTPUT);
     pinMode(LED_RED, OUTPUT);
-    pinMode(BUZZER_PIN, OUTPUT);
+    //pinMode(BUZZER_PIN, OUTPUT);
 
-    digitalWrite(LED_YELLOW, LOW);
+    digitalWrite(LED_GREEN, LOW);
     digitalWrite(LED_RED, LOW);
-    noTone(BUZZER_PIN);
+    //noTone(BUZZER_PIN);
 
     // Setup sensors
-    setupSen54();
+   // setupSen54();
     setupO2ADC();
     //setupBLE();
-    //setupSDCard();
+    setupSDCard();
 
     // Start ZE07 UART
     // Datasheet default 9600 baud, 8N1
@@ -610,22 +601,23 @@ void loop() {
 
         Serial.println(latestO2Percent, 2);
 
+        logO2DataToSD(now, elapsedHours);
         // Update alerts after new sensor values
-        //updateAlerts();
+        updateAlerts();
     }
 
     // BLE block - runs every 2 seconds
-    if (doBle) {
+   // if (doBle) {
         //sendBleUpdate();
-    }
+  //  }
 
     // SD logging block - runs once per second if enabled
-    if (doSdLog) {
+  //  if (doSdLog) {
         /*
         logZE07DataToSD(now, elapsedHours, latestZE07ppm);
         logO2DataToSD(now, elapsedHours);
         */
-    }
+   // }
     /*
     // Serial printing every second
     if (doPrint) {
