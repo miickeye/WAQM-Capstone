@@ -89,7 +89,7 @@ In development. Current work includes:
 ## Hardware Setup
 <img width="428" height="541" alt="image" src="https://github.com/user-attachments/assets/8aff9c71-0589-4807-b1b5-61bc91b8bb2d" />
 
-## BLE Telemetry
+## BLE Communication 
 <img width="1182" height="638" alt="image" src="https://github.com/user-attachments/assets/67d2a2e9-b3d4-4b49-b290-a910f15ab324" />
 
 
