@@ -82,6 +82,21 @@ In development. Current work includes:
 - Mobile application interface
 
 ---
+## Hardware Setup
+<img width="428" height="541" alt="image" src="https://github.com/user-attachments/assets/8aff9c71-0589-4807-b1b5-61bc91b8bb2d" />
+
+
+## Sensor Integration
+(photo)
+
+## BLE Telemetry
+(photo)
+
+## Testing and Calibration
+(photo)
+
+## System Block Diagram
+(photo)
 
 ## Authors
 
