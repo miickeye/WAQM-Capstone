@@ -11,11 +11,11 @@ The system provides immediate visual and audible alerts when unsafe conditions a
 ## System Components
 
 - Microcontroller: ESP32-S3 DevKitC-1
-- CO Sensor: Electrochemical (ME2-CO)
+- CO Sensor: Electrochemical (ZE07-CO)
 - O₂ Sensor: Electrochemical (ME2-O2)
 - Environmental Sensor: SEN54 (PM, temperature, humidity)
 - Signal Conditioning: Transimpedance amplifier (TIA)
-- Communication: BLE
+- Communication: BLE, ADC, UART, I2C
 - Power: Li-ion battery with boost converter
 
 ---
