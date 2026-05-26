@@ -82,21 +82,25 @@ In development. Current work includes:
 - Mobile application interface
 
 ---
+
+## System Block Diagram
+<img width="780" height="487" alt="image" src="https://github.com/user-attachments/assets/4944f10f-7f4f-4b71-9d1a-b7fb90f55720" />
+
 ## Hardware Setup
 <img width="428" height="541" alt="image" src="https://github.com/user-attachments/assets/8aff9c71-0589-4807-b1b5-61bc91b8bb2d" />
 
-
-## Sensor Integration
-(photo)
-
 ## BLE Telemetry
-(photo)
+<img width="1182" height="638" alt="image" src="https://github.com/user-attachments/assets/67d2a2e9-b3d4-4b49-b290-a910f15ab324" />
+
 
 ## Testing and Calibration
-(photo)
+<img width="423" height="492" alt="image" src="https://github.com/user-attachments/assets/a71325ce-6947-432d-bb1b-859c06a0c34a" />
+<img width="1216" height="651" alt="image" src="https://github.com/user-attachments/assets/a6a5667c-b524-432f-8601-a61170eb0067" />
+<img width="538" height="405" alt="image" src="https://github.com/user-attachments/assets/62744fb7-94a4-4eff-9478-e909ddf72746" />
+<img width="1210" height="596" alt="image" src="https://github.com/user-attachments/assets/14acf776-529e-4b3b-b066-1b8490b0dde7" />
+<img width="486" height="451" alt="image" src="https://github.com/user-attachments/assets/ad7452be-50c1-4714-b5c5-780676f8609f" />
 
-## System Block Diagram
-(photo)
+
 
 ## Authors
 
